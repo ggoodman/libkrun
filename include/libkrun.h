@@ -477,6 +477,7 @@ int32_t krun_set_kernel(uint32_t ctx_id,
 /**
  * Sets the read-only flag for the kernel boot arguments. This results in the root
  * filesystem being mounted read-only.
+ * 
  * Arguments:
  *  "ctx_id"        - the configuration context ID.
  *  "read_only"     - true when the root filesystem should be mounted read-only.
