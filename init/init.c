@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <net/if.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -20,7 +21,6 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <pthread.h>
 
 #include <linux/vm_sockets.h>
 
@@ -53,6 +53,7 @@ static pthread_mutex_t tunnel_setup_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tunnel_setup_cond = PTHREAD_COND_INITIALIZER;
 static int tunnel_setup_count = 0;
 static int tunnel_ready_count = 0;
+static int tunnel_failed_count = 0;
 
 static void setup_unix_tunnels(const char *tunnels_env);
 static void *unix_tunnel_proxy_thread(void *arg);
@@ -1000,7 +1001,8 @@ static void *unix_tunnel_proxy_thread(void *arg)
     struct sockaddr_vm vm_addr;
     fd_set read_fds;
     char buffer[4096];
-    int max_fd, ret;
+    int max_fd, ret, guest_path_len;
+    socklen_t addr_len = sizeof(struct sockaddr_un);
 
     if (tunnel->listen) {
         // Create Unix socket for listening
@@ -1010,25 +1012,45 @@ static void *unix_tunnel_proxy_thread(void *arg)
             goto thread_ready; // Still signal ready even on error
         }
 
-        memset(&unix_addr, 0, sizeof(unix_addr));
+        // All bytes of `sun_path` are used for abstract sockets. Make sure
+        // we zero out extra bytes for consistent behaviour.
+        memset(&unix_addr, 0, sizeof(struct sockaddr_un));
         unix_addr.sun_family = AF_UNIX;
-        if (strlen(tunnel->guest_path) >= sizeof(unix_addr.sun_path)) {
-            fprintf(stderr, "Unix socket path too long: %s\n", tunnel->guest_path);
+        guest_path_len = strlen(tunnel->guest_path);
+        if (guest_path_len >= sizeof(unix_addr.sun_path)) {
+            fprintf(stderr, "Unix socket path too long: %s\n",
+                    tunnel->guest_path);
             close(listen_sock);
+            listen_sock = -1;
+            goto thread_ready;
+        }
+        if (guest_path_len < 1) {
+            fprintf(stderr, "Unix socket path too short\n");
+            close(listen_sock);
+            listen_sock = -1;
             goto thread_ready;
         }
         strcpy(unix_addr.sun_path, tunnel->guest_path);
-        unlink(tunnel->guest_path); // Remove any existing socket
+        if (unix_addr.sun_path[0] == '@') {
+            unix_addr.sun_path[0] = '\0';
+            addr_len = sizeof(unix_addr.sun_family) + guest_path_len;
+        } else {
+            // Remove any existing socket but only if it isn't
+            // abstract.
+            unlink(tunnel->guest_path);
+        }
 
-        if (bind(listen_sock, (struct sockaddr *)&unix_addr, sizeof(unix_addr)) < 0) {
+        if (bind(listen_sock, (struct sockaddr *)&unix_addr, addr_len) < 0) {
             perror("Failed to bind Unix socket");
             close(listen_sock);
+            listen_sock = -1;
             goto thread_ready;
         }
 
         if (listen(listen_sock, 5) < 0) {
             perror("Failed to listen on Unix socket");
             close(listen_sock);
+            listen_sock = -1;
             goto thread_ready;
         }
 
@@ -1047,15 +1069,18 @@ static void *unix_tunnel_proxy_thread(void *arg)
         vm_addr.svm_cid = VMADDR_CID_ANY;
         vm_addr.svm_port = tunnel->vsock_port;
 
-        if (bind(vsock_sock, (struct sockaddr *)&vm_addr, sizeof(vm_addr)) < 0) {
+        if (bind(vsock_sock, (struct sockaddr *)&vm_addr, sizeof(vm_addr)) <
+            0) {
             perror("Failed to bind vsock socket");
             close(vsock_sock);
+            vsock_sock = -1;
             goto thread_ready;
         }
 
         if (listen(vsock_sock, 5) < 0) {
             perror("Failed to listen on vsock socket");
             close(vsock_sock);
+            vsock_sock = -1;
             goto thread_ready;
         }
 
@@ -1064,20 +1089,22 @@ static void *unix_tunnel_proxy_thread(void *arg)
     }
 
 thread_ready:
-    // Signal that this thread has set up (whether successfully or not)
+    // Signal completion (success or failure)
     pthread_mutex_lock(&tunnel_setup_mutex);
-    tunnel_ready_count++;
+    if ((tunnel->listen && listen_sock >= 0) ||
+        (!tunnel->listen && vsock_sock >= 0)) {
+        tunnel_ready_count++;
+    } else {
+        tunnel_failed_count++;
+    }
     pthread_cond_signal(&tunnel_setup_cond);
     pthread_mutex_unlock(&tunnel_setup_mutex);
-    
+
     // If setup failed, exit thread
-    if (tunnel->listen && listen_sock < 0) {
+    if ((listen_sock < 0) && (vsock_sock < 0)) {
         return NULL;
     }
-    if (!tunnel->listen && vsock_sock < 0) {
-        return NULL;
-    }
-    
+
     // Main proxy loop
     if (tunnel->listen) {
         // Listen mode: Accept Unix connections and proxy to vsock
@@ -1102,7 +1129,8 @@ thread_ready:
             vm_addr.svm_cid = VMADDR_CID_HOST;
             vm_addr.svm_port = tunnel->vsock_port;
 
-            if (connect(new_vsock_sock, (struct sockaddr *)&vm_addr, sizeof(vm_addr)) < 0) {
+            if (connect(new_vsock_sock, (struct sockaddr *)&vm_addr,
+                        sizeof(vm_addr)) < 0) {
                 perror("Failed to connect to host via vsock");
                 close(connect_sock);
                 close(new_vsock_sock);
@@ -1114,21 +1142,27 @@ thread_ready:
                 FD_ZERO(&read_fds);
                 FD_SET(connect_sock, &read_fds);
                 FD_SET(new_vsock_sock, &read_fds);
-                max_fd = (connect_sock > new_vsock_sock) ? connect_sock : new_vsock_sock;
+                max_fd = (connect_sock > new_vsock_sock) ? connect_sock
+                                                         : new_vsock_sock;
 
                 ret = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-                if (ret <= 0) break;
+                if (ret <= 0)
+                    break;
 
                 if (FD_ISSET(connect_sock, &read_fds)) {
                     ret = read(connect_sock, buffer, sizeof(buffer));
-                    if (ret <= 0) break;
-                    if (write(new_vsock_sock, buffer, ret) != ret) break;
+                    if (ret <= 0)
+                        break;
+                    if (write(new_vsock_sock, buffer, ret) != ret)
+                        break;
                 }
 
                 if (FD_ISSET(new_vsock_sock, &read_fds)) {
                     ret = read(new_vsock_sock, buffer, sizeof(buffer));
-                    if (ret <= 0) break;
-                    if (write(connect_sock, buffer, ret) != ret) break;
+                    if (ret <= 0)
+                        break;
+                    if (write(connect_sock, buffer, ret) != ret)
+                        break;
                 }
             }
 
@@ -1155,15 +1189,24 @@ thread_ready:
 
             memset(&unix_addr, 0, sizeof(unix_addr));
             unix_addr.sun_family = AF_UNIX;
-            if (strlen(tunnel->guest_path) >= sizeof(unix_addr.sun_path)) {
-                fprintf(stderr, "Unix socket path too long: %s\n", tunnel->guest_path);
+            guest_path_len = strlen(tunnel->guest_path);
+            if (guest_path_len >= sizeof(unix_addr.sun_path)) {
+                fprintf(stderr, "Unix socket path too long: %s\n",
+                        tunnel->guest_path);
                 close(connect_sock);
                 close(new_listen_sock);
                 continue;
             }
             strcpy(unix_addr.sun_path, tunnel->guest_path);
 
-            if (connect(new_listen_sock, (struct sockaddr *)&unix_addr, sizeof(unix_addr)) < 0) {
+            // Handle abstract Unix domain sockets (starting with @)
+            if (unix_addr.sun_path[0] == '@') {
+                unix_addr.sun_path[0] = '\0';
+                addr_len = sizeof(unix_addr.sun_family) + guest_path_len;
+            }
+
+            if (connect(new_listen_sock, (struct sockaddr *)&unix_addr,
+                        addr_len) < 0) {
                 perror("Failed to connect to Unix socket");
                 close(connect_sock);
                 close(new_listen_sock);
@@ -1175,21 +1218,27 @@ thread_ready:
                 FD_ZERO(&read_fds);
                 FD_SET(connect_sock, &read_fds);
                 FD_SET(new_listen_sock, &read_fds);
-                max_fd = (connect_sock > new_listen_sock) ? connect_sock : new_listen_sock;
+                max_fd = (connect_sock > new_listen_sock) ? connect_sock
+                                                          : new_listen_sock;
 
                 ret = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-                if (ret <= 0) break;
+                if (ret <= 0)
+                    break;
 
                 if (FD_ISSET(connect_sock, &read_fds)) {
                     ret = read(connect_sock, buffer, sizeof(buffer));
-                    if (ret <= 0) break;
-                    if (write(new_listen_sock, buffer, ret) != ret) break;
+                    if (ret <= 0)
+                        break;
+                    if (write(new_listen_sock, buffer, ret) != ret)
+                        break;
                 }
 
                 if (FD_ISSET(new_listen_sock, &read_fds)) {
                     ret = read(new_listen_sock, buffer, sizeof(buffer));
-                    if (ret <= 0) break;
-                    if (write(connect_sock, buffer, ret) != ret) break;
+                    if (ret <= 0)
+                        break;
+                    if (write(connect_sock, buffer, ret) != ret)
+                        break;
                 }
             }
 
@@ -1197,7 +1246,7 @@ thread_ready:
             close(new_listen_sock);
         }
     }
-    
+
     return NULL;
 }
 
@@ -1221,9 +1270,11 @@ static void setup_unix_tunnels(const char *tunnels_env)
     pthread_mutex_lock(&tunnel_setup_mutex);
     tunnel_setup_count = 0;
     tunnel_ready_count = 0;
+    tunnel_failed_count = 0;
     pthread_mutex_unlock(&tunnel_setup_mutex);
 
-    // Parse tunnels: "guest_path1:vsock_port1:listen,guest_path2:vsock_port2:connect,..."
+    // Parse tunnels:
+    // "guest_path1:vsock_port1:listen,guest_path2:vsock_port2:connect,..."
     tunnel_str = strtok_r(tunnels_copy, ",", &saveptr);
     while (tunnel_str != NULL) {
         char *guest_path, *vsock_port_str, *mode_str;
@@ -1236,9 +1287,12 @@ static void setup_unix_tunnels(const char *tunnels_env)
 
         if (guest_path && vsock_port_str && mode_str) {
             // Validate guest path length for Unix socket compatibility
-            if (strlen(guest_path) >= sizeof(((struct sockaddr_un*)0)->sun_path)) {
-                fprintf(stderr, "Guest socket path too long (max %zu chars): %s\n", 
-                        sizeof(((struct sockaddr_un*)0)->sun_path) - 1, guest_path);
+            if (strlen(guest_path) >=
+                sizeof(((struct sockaddr_un *)0)->sun_path)) {
+                fprintf(stderr,
+                        "Guest socket path too long (max %zu chars): %s\n",
+                        sizeof(((struct sockaddr_un *)0)->sun_path) - 1,
+                        guest_path);
                 tunnel_str = strtok_r(NULL, ",", &saveptr);
                 continue;
             }
@@ -1249,7 +1303,8 @@ static void setup_unix_tunnels(const char *tunnels_env)
                 break;
             }
 
-            strncpy(tunnel->guest_path, guest_path, sizeof(tunnel->guest_path) - 1);
+            strncpy(tunnel->guest_path, guest_path,
+                    sizeof(tunnel->guest_path) - 1);
             tunnel->guest_path[sizeof(tunnel->guest_path) - 1] = '\0';
             tunnel->listen = (strcmp(mode_str, "listen") == 0) ? 1 : 0;
             tunnel->vsock_port = atoi(vsock_port_str);
@@ -1260,7 +1315,8 @@ static void setup_unix_tunnels(const char *tunnels_env)
             pthread_mutex_unlock(&tunnel_setup_mutex);
 
             // Create thread for this tunnel
-            if (pthread_create(&thread, NULL, unix_tunnel_proxy_thread, tunnel) != 0) {
+            if (pthread_create(&thread, NULL, unix_tunnel_proxy_thread,
+                               tunnel) != 0) {
                 perror("Failed to create tunnel thread");
                 free(tunnel);
                 // Decrement count since thread creation failed
@@ -1268,17 +1324,27 @@ static void setup_unix_tunnels(const char *tunnels_env)
                 tunnel_setup_count--;
                 pthread_mutex_unlock(&tunnel_setup_mutex);
             } else {
-                pthread_detach(thread); // Detach so thread resources are cleaned up
+                pthread_detach(
+                    thread); // Detach so thread resources are cleaned up
             }
         }
 
         tunnel_str = strtok_r(NULL, ",", &saveptr);
     }
 
-    // Wait for all tunnel threads to be ready
+    // Wait for all tunnel threads to complete setup
     pthread_mutex_lock(&tunnel_setup_mutex);
-    while (tunnel_ready_count < tunnel_setup_count) {
+    while ((tunnel_ready_count + tunnel_failed_count) < tunnel_setup_count) {
         pthread_cond_wait(&tunnel_setup_cond, &tunnel_setup_mutex);
+    }
+
+    // Check if any tunnels failed
+    if (tunnel_failed_count > 0) {
+        fprintf(stderr, "Failed to set up %d tunnel(s). Exiting.\n",
+                tunnel_failed_count);
+        pthread_mutex_unlock(&tunnel_setup_mutex);
+        free(tunnels_copy);
+        exit(1);
     }
     pthread_mutex_unlock(&tunnel_setup_mutex);
 
