@@ -1,0 +1,5 @@
+{
+  "git.alwaysSignOff": true,
+  "git.enableCommitSigning": true,
+  "rust-analyzer.cargo.features": ["blk", "net"]
+}
